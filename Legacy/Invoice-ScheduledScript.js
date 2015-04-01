@@ -829,7 +829,7 @@ function CreateVendorBill(invoice)
 								if (nlapiGetContext().getSetting('SCRIPT', 'custscript_custfieldline' + y))
 									{
 										var custfield;
-										var valuetoinsert;
+										var valuetoinsert = null;
 										var textOrValue;
 										if (nlapiGetContext().getSetting('SCRIPT', 'custscript_custfieldline' + y).split(':'))
 											{
