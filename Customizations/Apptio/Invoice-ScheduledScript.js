@@ -1,8 +1,37 @@
 /**
  * Module Description
  * This scheduled script pulls OK to Pay invoices from Coupa into Netsuite
- * 
+ *********************************************************************************
+ * CHANGELOG
+ *********************************************************************************
+ * 3/31/2015: Modification by Doug Quinn
+ * This script has been customized starting with a legacy Coupa
+ * baseline script. (provided by Coupa implementation manager Navin on 3/24/2015).
  *
+ * Item 1: Script has been formatted using a javascript code formatter.
+ *
+ * Item 2: Script has been extended to allow setting a manual posting period override,
+ *         which if set on an invoice in Coupa, will use that posting
+ *         period instead of the default logic in this script. New script parameter:
+ *         custscript_customfield_paymentperiodover (Coupa Payment Period Override Field) will hold
+ *         the Coupa internal field name of a custom field on the invoice header with Lookup.name values
+ *         that exactly match valid NetSuite posting periods and will be maintained by NetSuite admins.
+ *
+ * Item 3: Header and Line level custom fields now support type Lookup.name to use the .name field
+ *         as an option instead of the external-ref-num which is the default if the type is just Lookup.
+ *
+ * Item 4: Modified default posting period behavior to use only the invoice date (never the integration timestamp)
+ *         Posting period is = to invoice date month / year (rolling back an extra month if cutoffdays is not passed)
+ *         Added parseIntNullNaNSafe() to properly convert date splits to numbers (previous code did not correctly do this and cutoffdays didn't work)
+ *         Before submitting record to NetSuite, will validate that the posting period represented in Coupa with an active LookupValue
+ *         Encapsulated posting period logic into sub function as this to avoid gigantic duplicate code blocks
+ *         
+ * Item 5: Put invoice get query into wrapper function executeCoupaQuery to remove code duplication now that I need to add Lookup Value getting
+ *
+ * Item 6: Replaced all parseFloat() calls with parseFloatNullNaNSafe() which returns 0.00 on invalid input.
+ *         This was necessary to fix NaN type errors when Coupa was not initializing values in the database to 0.00 such as on tax-header
+ *         Removed the three tax-header if() checks added by Coupa as the logic was incorrect and didn't fully address the problem.
+ *********************************************************************************
  */
 /**
  * @param {String} type Context Types: scheduled, ondemand, userinterface, aborted, skipped
@@ -16,9 +45,35 @@ function scheduled(type)
   var param_APIKey = context.getSetting('SCRIPT', 'custscript_apikey');
   var invoiceFromdate;
   var invoiceTodate = context.getSetting('SCRIPT', 'custscript_toinvdate');
+  var url = '';
+  var lookupValueOpenPostingPeriodNames = new Array();
 
 
-  var url = param_url + '/api/invoices?exported=false&status=approved';
+  //Query active Lookup Values from the Posting Periods Lookup
+  url = param_url + '/api/lookup_values?active=true&lookup[name]=Posting%20Periods';
+  var response = executeCoupaQuery(url, param_APIKey, 'Get Coupa Open Posting Periods');
+
+
+  //Process and temporarily store active Lookup Values from the Posting Periods Lookup
+  if (response.getCode() == '200')
+  {
+    var responseXML = nlapiStringToXML(response.getBody());
+    var lookupValuesNode = nlapiSelectNode(responseXML, 'lookup-values');
+    var lookupValueOpenPostingPeriodsXML = nlapiSelectNodes(lookupValuesNode, 'lookup-value');
+    var numOpenPostingPeriods = lookupValueOpenPostingPeriodsXML.length;
+
+    for (var i = 0; i < numOpenPostingPeriods; i++)
+    {
+      lookupValueOpenPostingPeriodNames.push(nlapiSelectValue(lookupValueOpenPostingPeriodsXML[i], 'name'));
+      nlapiLogExecution('AUDIT', 'Found Coupa Open Posting Period', lookupValueOpenPostingPeriodNames[i]);
+    }
+  }
+  else
+    nlapiLogExecution('AUDIT', 'Zero Open Coupa Posting Periods found');
+
+
+  //Query APPROVED Unexported Invoices from Coupa
+  url = param_url + '/api/invoices?exported=false&status=approved';
 
   if (context.getSetting('SCRIPT', 'custscript_use_updatedat_date') == 'T')
   {
@@ -49,44 +104,9 @@ function scheduled(type)
     url = url + '&limit=' + context.getSetting('SCRIPT', 'custscript_limit');
 
 
-  nlapiLogExecution('DEBUG', 'URL is ', url);
+  response = executeCoupaQuery(url, param_APIKey, 'Export Approved Invoices');
 
-
-  var headers = new Array();
-  headers['Accept'] = 'text/xml';
-  headers['X-COUPA-API-KEY'] = param_APIKey;
-  var response = ''
-
-  //try start
-  try
-  {
-    response = nlapiRequestURL(url, null, headers);
-  }
-  catch (error)
-  {
-    if (error instanceof nlobjError)
-    {
-      var errordetails;
-      errorcode = error.getCode();
-      switch (errorcode)
-      {
-        case "SSS_REQUEST_TIME_EXCEEDED":
-          errordetails = "Connection closed because it has exceed the time out period (NetSuite has not received a response after 5 seconds on initial connection or after 45 seconds on the request).";
-          exit = true;
-          break;
-        default:
-          errordetails = error.getDetails() + ".";
-          exit = true;
-          break;
-      }
-      nlapiLogExecution('ERROR', 'Processing Error - Unable to do Coupa request api call to export Invoices', 'Error Code = ' + errorcode + ' Error Description = ' + errordetails);
-      nlapiSendEmail(-5, nlapiGetContext().getSetting('SCRIPT', 'custscript_emailaddr_notifications'), nlapiGetContext().getSetting('SCRIPT', 'custscript_acccountname') + ' Invoice Integration:Processing Error - Unable to do Coupa request api call to export Invoices',
-        'Error Code = ' + errorcode + ' Error Description = ' + errordetails);
-
-    }
-  } //catch end
-
-
+  //Process APPROVED Unexported Invoices from Coupa
   if (response.getCode() == '200')
   {
 
@@ -128,7 +148,7 @@ function scheduled(type)
       invoiceexists = vendorBillExists(tranid, externalid, entityid);
 
       if (invoiceexists == 'false')
-        CreateVendorBillorVendorCredit(invoiceHeaderNodes[i]);
+        CreateVendorBillorVendorCredit(invoiceHeaderNodes[i], lookupValueOpenPostingPeriodNames);
 
       else
       {
@@ -139,7 +159,7 @@ function scheduled(type)
           nlapiGetContext().getSetting('SCRIPT', 'custscript_acccountname') + ' Invoice Integration:Processing Error - Cannot create Vendor Bill as it already exists in Netsuite',
           'Invoice Number = ' + tranid + ' Vendor = ' + nlapiSelectValue(invoiceHeaderNodes[i], 'supplier/name') + ' Netsuite Vendor Bill id = ' + invoiceexists);
 
-        //    			UpdateVendorBill(invoiceHeaderNodes[i], invoiceexists);
+        //          UpdateVendorBill(invoiceHeaderNodes[i], invoiceexists);
       }
 
 
@@ -149,15 +169,15 @@ function scheduled(type)
   else
     nlapiLogExecution('AUDIT', 'Zero Coupa Ok to Pay Invoices to export');
 
-  // check for exported and now voided invoices
+
+
+  //Query VOIDED Unexported Invoices from Coupa
   var enable_support_void = 0; //by default not supported
 
   if (context.getSetting('SCRIPT', 'custscript_supportvoid'))
   {
     enable_support_void = context.getSetting('SCRIPT', 'custscript_supportvoid');
   }
-
-
 
   if (enable_support_void == 1)
   {
@@ -173,39 +193,9 @@ function scheduled(type)
     {
       url = url + '&invoice-date[lt_or_eq]=' + netsuitedatetoCoupadate(context.getSetting('SCRIPT', 'custscript_toinvdate'));
     }
+    response = executeCoupaQuery(url, param_APIKey, 'Export Voided Invoices');
 
-    //try start
-    try
-    {
-      response = nlapiRequestURL(url, null, headers);
-    }
-    catch (error)
-    {
-      if (error instanceof nlobjError)
-      {
-        var errordetails;
-        errorcode = error.getCode();
-        switch (errorcode)
-        {
-          case "SSS_REQUEST_TIME_EXCEEDED":
-            errordetails = "Connection closed because it has exceed the time out period (NetSuite has not received a response after 5 seconds on initial connection or after 45 seconds on the request).";
-            exit = true;
-            break;
-          default:
-            errordetails = error.getDetails() + ".";
-            exit = true;
-            break;
-        }
-        nlapiLogExecution('ERROR', 'Processing Error - Unable to do Coupa request api call to check exported and now voided Invoices', 'Error Code = ' + errorcode + ' Error Description = ' + errordetails);
-        nlapiSendEmail(-5, nlapiGetContext().getSetting('SCRIPT', 'custscript_emailaddr_notifications'), nlapiGetContext().getSetting('SCRIPT', 'custscript_acccountname') + ' Invoice Integration:Processing Error - Unable to do Coupa request api call to check exported and now voided Invoices',
-          'Error Code = ' + errorcode + ' Error Description = ' + errordetails);
-
-      }
-    } //catch end
-
-
-
-
+    //Process VOIDED Unexported Invoices from Coupa
     if (response.getCode() == '200')
     {
 
@@ -251,7 +241,7 @@ function scheduled(type)
 }
 
 
-function CreateVendorBillorVendorCredit(invoice)
+function CreateVendorBillorVendorCredit(invoice, lookupValueOpenPostingPeriodNames)
 {
   var bill = false;
   var credit = false;
@@ -263,9 +253,9 @@ function CreateVendorBillorVendorCredit(invoice)
 
   for (var x = 0; x < invoiceLineNodes.length; x++)
   {
-    invoicetotal = invoicetotal + parseFloat(nlapiSelectValue(invoiceLineNodes[x], 'total'));
+    invoicetotal = invoicetotal + parseFloatNullNaNSafe(nlapiSelectValue(invoiceLineNodes[x], 'total'));
 
-    if (parseFloat(nlapiSelectValue(invoiceLineNodes[x], 'total')) < 0)
+    if (parseFloatNullNaNSafe(nlapiSelectValue(invoiceLineNodes[x], 'total')) < 0)
     {
       credit = true;
     }
@@ -281,27 +271,27 @@ function CreateVendorBillorVendorCredit(invoice)
   if (creditMemoOption == 1)
   {
     if (bill == true)
-      CreateVendorBill(invoice);
+      CreateVendorBill(invoice, lookupValueOpenPostingPeriodNames);
 
     if (credit == true)
-      CreateVendorCredit(invoice);
+      CreateVendorCredit(invoice, lookupValueOpenPostingPeriodNames);
   }
   else if (creditMemoOption == 2)
   {
     if (invoicetotal >= 0)
     {
       //nlapiLogExecution('DEBUG', 'creating vendor bill ', 'amount = ' + invoicetotal );
-      CreateVendorBill(invoice);
+      CreateVendorBill(invoice, lookupValueOpenPostingPeriodNames);
     }
     else
     {
       //nlapiLogExecution('DEBUG', 'creating vendor credit ', 'amount = '+ invoicetotal );
-      CreateVendorCredit(invoice);
+      CreateVendorCredit(invoice, lookupValueOpenPostingPeriodNames);
     }
   }
 }
 
-function CreateVendorCredit(invoice)
+function CreateVendorCredit(invoice, lookupValueOpenPostingPeriodNames)
 {
   var record = nlapiCreateRecord('vendorcredit');
 
@@ -332,40 +322,10 @@ function CreateVendorCredit(invoice)
   }
 
 
+  if (!setNetSuitePostingPeriod(invoice, record, lookupValueOpenPostingPeriodNames))
+    return;
 
-  // set the posting period
-  var today = new Date();
-  var postingPeriod = getMonthShortName(today.getMonth()) + ' ' + today.getFullYear();
-  var cutoffday = 5;
-  if (nlapiGetContext().getSetting('SCRIPT', 'custscript_cutoffdate'))
-    cutoffday = nlapiGetContext().getSetting('SCRIPT', 'custscript_cutoffdate');
-  if (today.getDate() < cutoffday)
-  {
-    var nDate = nlapiSelectValue(invoice, 'invoice-date').split('T');
-    var datesplit = nDate[0].split('-');
-    var Nyear = datesplit[0];
-    var Nday = datesplit[2];
-    var Nmonth = datesplit[1] - 1;
 
-    if (today.getFullYear() > Nyear)
-    {
-      if (today.getMonth() == 0)
-        postingPeriod = getMonthShortName('11') + ' ' + (today.getFullYear() - 1);
-      else
-        postingPeriod = getMonthShortName(today.getMonth() - 1) + ' ' + today.getFullYear();
-    }
-
-    if (Nmonth < today.getMonth() && Nyear == today.getFullYear())
-      postingPeriod = getMonthShortName(today.getMonth() - 1) + ' ' + today.getFullYear();
-  }
-
-  nlapiLogExecution('DEBUG', 'Calculated Posting Period is ', postingPeriod);
-
-  var postingPeriodId = getAccoutingPeriodNetsuiteId('accountingperiod', postingPeriod);
-
-  //nlapiLogExecution('DEBUG', 'Posting Period: ', 'name = ' + postingPeriod + ' Id = ' + postingPeriodId);
-
-  record.setFieldValue('postingperiod', postingPeriodId);
 
   // set currency
   var curr = getNetsuiteCurrency('currency', nlapiSelectValue(invoice, 'currency/code'))
@@ -378,21 +338,21 @@ function CreateVendorCredit(invoice)
   invoiceLineNodes = nlapiSelectNodes(invoiceLine, 'invoice-line');
 
 
-  var shippingamount = parseFloat(nlapiSelectValue(invoice, 'shipping-amount'));
-  var handlingamount = parseFloat(nlapiSelectValue(invoice, 'handling-amount'));
-  var taxamount = parseFloat(nlapiSelectValue(invoice, 'tax-amount'));
-  var miscamount = parseFloat(nlapiSelectValue(invoice, 'misc-amount'));
+  var shippingamount = parseFloatNullNaNSafe(nlapiSelectValue(invoice, 'shipping-amount'));
+  var handlingamount = parseFloatNullNaNSafe(nlapiSelectValue(invoice, 'handling-amount'));
+  var taxamount = parseFloatNullNaNSafe(nlapiSelectValue(invoice, 'tax-amount'));
+  var miscamount = parseFloatNullNaNSafe(nlapiSelectValue(invoice, 'misc-amount'));
 
   /*
-	nlapiLogExecution('DEBUG', 'Other Charges', 'Shipping = ' + shippingamount + ' Handling = ' + handlingamount 
-												+ ' Taxamount = ' + taxamount + ' miscamount = ' + miscamount); */
+  nlapiLogExecution('DEBUG', 'Other Charges', 'Shipping = ' + shippingamount + ' Handling = ' + handlingamount
+  + ' Taxamount = ' + taxamount + ' miscamount = ' + miscamount); */
 
 
   var totalheadercharges;
   if (lineleveltaxation == 'false')
-    totalheadercharges = parseFloat(shippingamount) + parseFloat(handlingamount) + parseFloat(taxamount) + parseFloat(miscamount);
+    totalheadercharges = parseFloatNullNaNSafe(shippingamount) + parseFloatNullNaNSafe(handlingamount) + parseFloatNullNaNSafe(taxamount) + parseFloatNullNaNSafe(miscamount);
   else
-    totalheadercharges = parseFloat(shippingamount) + parseFloat(handlingamount) + parseFloat(miscamount);
+    totalheadercharges = parseFloatNullNaNSafe(shippingamount) + parseFloatNullNaNSafe(handlingamount) + parseFloatNullNaNSafe(miscamount);
 
   var invoiceLine = nlapiSelectNode(invoice, 'invoice-lines');
   var invoiceLineNodes = new Array();
@@ -405,12 +365,12 @@ function CreateVendorCredit(invoice)
   for (var x = 0; x < invoiceLineNodes.length; x++)
   {
     if (nlapiSelectValue(invoiceLineNodes[x], 'nontaxable') != 'true')
-      taxabletotalamount = parseFloat(taxabletotalamount) + parseFloat(nlapiSelectValue(invoiceLineNodes[x], 'total'));
+      taxabletotalamount = parseFloatNullNaNSafe(taxabletotalamount) + parseFloatNullNaNSafe(nlapiSelectValue(invoiceLineNodes[x], 'total'));
 
-    totalamount = parseFloat(totalamount) + parseFloat(nlapiSelectValue(invoiceLineNodes[x], 'total'));
+    totalamount = parseFloatNullNaNSafe(totalamount) + parseFloatNullNaNSafe(nlapiSelectValue(invoiceLineNodes[x], 'total'));
   }
 
-  var totalheaderamount = parseFloat(totalamount) + parseFloat(totalheadercharges);
+  var totalheaderamount = parseFloatNullNaNSafe(totalamount) + parseFloatNullNaNSafe(totalheadercharges);
   totalheaderamount = totalheaderamount.toFixed(3);
   var totalcalcamount = 0;
 
@@ -426,12 +386,12 @@ function CreateVendorCredit(invoice)
         record.setFieldValue('memo', nlapiSelectValue(invoiceLineNodes[x], 'description'));
     }
 
-    var linetax = parseFloat(nlapiSelectValue(invoiceLineNodes[x], 'tax-amount'));
+    var linetax = parseFloatNullNaNSafe(nlapiSelectValue(invoiceLineNodes[x], 'tax-amount'));
 
     if (linetax)
-      totalheaderamount = parseFloat(totalheaderamount) + parseFloat(linetax);
+      totalheaderamount = parseFloatNullNaNSafe(totalheaderamount) + parseFloatNullNaNSafe(linetax);
 
-    var invoicelineamount = parseFloat(nlapiSelectValue(invoiceLineNodes[x], 'total'));
+    var invoicelineamount = parseFloatNullNaNSafe(nlapiSelectValue(invoiceLineNodes[x], 'total'));
     var splitaccounting = 'FALSE';
     var actalloc = nlapiSelectNode(invoiceLineNodes[x], 'account-allocations');
     var accountallocations = new Array();
@@ -446,25 +406,25 @@ function CreateVendorCredit(invoice)
     {
       for (var i = 0; i < accountallocations.length; i++)
       {
-        var lineamount = parseFloat(nlapiSelectValue(accountallocations[i], 'amount'));
-        var linecharge = (parseFloat(lineamount) / parseFloat(taxabletotalamount)) * totalheadercharges;
+        var lineamount = parseFloatNullNaNSafe(nlapiSelectValue(accountallocations[i], 'amount'));
+        var linecharge = (parseFloatNullNaNSafe(lineamount) / parseFloatNullNaNSafe(taxabletotalamount)) * totalheadercharges;
         var splitlinetax;
         if (linetax)
         {
-          splitlinetax = (parseFloat(lineamount) / parseFloat(invoicelineamount)) * linetax;
+          splitlinetax = (parseFloatNullNaNSafe(lineamount) / parseFloatNullNaNSafe(invoicelineamount)) * linetax;
           //nlapiLogExecution('DEBUG', 'split line tax details ', 'splitline amount = ' + lineamount + ' splitlinetax = ' + splitlinetax);
         }
         var adjlineamount;
 
         if (linetax)
-          adjlineamount = parseFloat(lineamount) + parseFloat(linecharge) + parseFloat(splitlinetax);
+          adjlineamount = parseFloatNullNaNSafe(lineamount) + parseFloatNullNaNSafe(linecharge) + parseFloatNullNaNSafe(splitlinetax);
         else
         {
           // customization for nontaxable
           if (nlapiSelectValue(invoiceLineNodes[x], 'nontaxable') == 'true')
-            adjlineamount = parseFloat(lineamount);
+            adjlineamount = parseFloatNullNaNSafe(lineamount);
           else
-            adjlineamount = parseFloat(lineamount) + parseFloat(linecharge);
+            adjlineamount = parseFloatNullNaNSafe(lineamount) + parseFloatNullNaNSafe(linecharge);
         }
         adjlineamount = adjlineamount.toFixed(2);
         var accountNode = nlapiSelectNode(accountallocations[i], 'account');
@@ -532,7 +492,7 @@ function CreateVendorCredit(invoice)
 
 
 
-        // check for Coupa order line 
+        // check for Coupa order line
         if (nlapiSelectValue(invoiceLineNodes[x], 'order-header-num') && nlapiSelectValue(invoiceLineNodes[x], 'order-line-num'))
         {
           var poheadernum = nlapiSelectValue(invoiceLineNodes[x], 'order-header-num');
@@ -544,23 +504,23 @@ function CreateVendorCredit(invoice)
         record.setCurrentLineItemValue('expense', 'memo', nlapiSelectValue(invoiceLineNodes[x], 'description'));
         record.setCurrentLineItemValue('expense', 'isbillable', 'T');
 
-        if ((i == 0) && (x == 0)) totalcalcamount = parseFloat(adjlineamount);
-        else totalcalcamount = parseFloat(totalcalcamount) + parseFloat(adjlineamount);
+        if ((i == 0) && (x == 0)) totalcalcamount = parseFloatNullNaNSafe(adjlineamount);
+        else totalcalcamount = parseFloatNullNaNSafe(totalcalcamount) + parseFloatNullNaNSafe(adjlineamount);
 
         //nlapiLogExecution('DEBUG', 'Invoice Line details ', 'Invoice Line ' + x + ' SplitLine = ' + i + ' adjlineamount = ' + adjlineamount);
 
         if ((x == invoiceLineNodes.length - 1) && (i == accountallocations.length - 1))
         {
           var roundingerror = totalheaderamount - totalcalcamount;
-          /*nlapiLogExecution('DEBUG', 'Rounding Error Details ', 'RoundingError = ' + roundingerror + 
-							' totalheaderamount = ' + totalheaderamount + ' totalcalcamount = ' + totalcalcamount); */
+          /*nlapiLogExecution('DEBUG', 'Rounding Error Details ', 'RoundingError = ' + roundingerror +
+          ' totalheaderamount = ' + totalheaderamount + ' totalcalcamount = ' + totalcalcamount); */
           if (roundingerror)
           {
-            roundingerror = Math.round(parseFloat(roundingerror) * 100) / 100;
-            adjlineamount = parseFloat(adjlineamount) + roundingerror;
+            roundingerror = Math.round(parseFloatNullNaNSafe(roundingerror) * 100) / 100;
+            adjlineamount = parseFloatNullNaNSafe(adjlineamount) + roundingerror;
           }
         }
-        record.setCurrentLineItemValue('expense', 'amount', Math.abs(parseFloat(adjlineamount)));
+        record.setCurrentLineItemValue('expense', 'amount', Math.abs(parseFloatNullNaNSafe(adjlineamount)));
 
         record.commitLineItem('expense');
 
@@ -570,29 +530,29 @@ function CreateVendorCredit(invoice)
     else
     {
 
-      var lineamount = parseFloat(nlapiSelectValue(invoiceLineNodes[x], 'total'));
-      var linecharge = (parseFloat(lineamount) / parseFloat(taxabletotalamount)) * totalheadercharges;
+      var lineamount = parseFloatNullNaNSafe(nlapiSelectValue(invoiceLineNodes[x], 'total'));
+      var linecharge = (parseFloatNullNaNSafe(lineamount) / parseFloatNullNaNSafe(taxabletotalamount)) * totalheadercharges;
       var adjlineamount;
 
       if (linetax)
-        adjlineamount = parseFloat(lineamount) + parseFloat(linecharge) + parseFloat(linetax);
+        adjlineamount = parseFloatNullNaNSafe(lineamount) + parseFloatNullNaNSafe(linecharge) + parseFloatNullNaNSafe(linetax);
       else
       {
         // customization for nontaxable
         if (nlapiSelectValue(invoiceLineNodes[x], 'nontaxable') == 'true')
-          adjlineamount = parseFloat(lineamount);
+          adjlineamount = parseFloatNullNaNSafe(lineamount);
         else
-          adjlineamount = parseFloat(lineamount) + parseFloat(linecharge);
+          adjlineamount = parseFloatNullNaNSafe(lineamount) + parseFloatNullNaNSafe(linecharge);
       }
       adjlineamount = adjlineamount.toFixed(2);
-      /*	
-			nlapiLogExecution('DEBUG', 'Line Details: ', 'linenum' + x +
-														' lineamount = ' + lineamount +
-														' linecharge = ' + linecharge +
-														'taxabletotalamount = ' + taxabletotalamount +
-														' totalheadercharges = ' + totalheadercharges +
-														' adjlineamount = ' + adjlineamount );
-		*/
+      /*
+      nlapiLogExecution('DEBUG', 'Line Details: ', 'linenum' + x +
+      ' lineamount = ' + lineamount +
+      ' linecharge = ' + linecharge +
+      'taxabletotalamount = ' + taxabletotalamount +
+      ' totalheadercharges = ' + totalheadercharges +
+      ' adjlineamount = ' + adjlineamount );
+      */
 
       var accountNode = nlapiSelectNode(invoiceLineNodes[x], 'account');
 
@@ -676,24 +636,24 @@ function CreateVendorCredit(invoice)
       record.setCurrentLineItemValue('expense', 'memo', nlapiSelectValue(invoiceLineNodes[x], 'description'));
       record.setCurrentLineItemValue('expense', 'isbillable', 'T');
 
-      if (x == 0) totalcalcamount = parseFloat(adjlineamount);
-      else totalcalcamount = parseFloat(totalcalcamount) + parseFloat(adjlineamount);
+      if (x == 0) totalcalcamount = parseFloatNullNaNSafe(adjlineamount);
+      else totalcalcamount = parseFloatNullNaNSafe(totalcalcamount) + parseFloatNullNaNSafe(adjlineamount);
 
 
-      //	nlapiLogExecution('DEBUG', 'Invoice Line details ', 'Line ' + x + ' adjlineamount = ' + adjlineamount);
+      //  nlapiLogExecution('DEBUG', 'Invoice Line details ', 'Line ' + x + ' adjlineamount = ' + adjlineamount);
 
       if (x == invoiceLineNodes.length - 1)
       {
         var roundingerror = totalheaderamount - totalcalcamount;
-        /*nlapiLogExecution('DEBUG', 'Rounding Error Details ', 'RoundingError = ' + roundingerror + 
-						' totalheaderamount = ' + totalheaderamount + ' totalcalcamount = ' + totalcalcamount); */
+        /*nlapiLogExecution('DEBUG', 'Rounding Error Details ', 'RoundingError = ' + roundingerror +
+        ' totalheaderamount = ' + totalheaderamount + ' totalcalcamount = ' + totalcalcamount); */
         if (roundingerror)
         {
-          roundingerror = Math.round(parseFloat(roundingerror) * 100) / 100;
-          adjlineamount = parseFloat(adjlineamount) + roundingerror;
+          roundingerror = Math.round(parseFloatNullNaNSafe(roundingerror) * 100) / 100;
+          adjlineamount = parseFloatNullNaNSafe(adjlineamount) + roundingerror;
         }
       }
-      record.setCurrentLineItemValue('expense', 'amount', Math.abs(parseFloat(adjlineamount)));
+      record.setCurrentLineItemValue('expense', 'amount', Math.abs(parseFloatNullNaNSafe(adjlineamount)));
 
       record.commitLineItem('expense');
     } // end of else --- i.e if not split accounting
@@ -719,7 +679,7 @@ function CreateVendorCredit(invoice)
 }
 
 
-function CreateVendorBill(invoice)
+function CreateVendorBill(invoice, lookupValueOpenPostingPeriodNames)
 {
   var record;
   // vendorbill form config
@@ -793,39 +753,9 @@ function CreateVendorBill(invoice)
       record.setFieldValue('account', apAccountId);
   }
 
+  if (!setNetSuitePostingPeriod(invoice, record, lookupValueOpenPostingPeriodNames))
+    return;
 
-  // set the posting period
-  var today = new Date();
-  var postingPeriod = getMonthShortName(today.getMonth()) + ' ' + today.getFullYear();
-  var cutoffday = 5;
-  cutoffday = nlapiGetContext().getSetting('SCRIPT', 'custscript_cutoffdate');
-  if (today.getDate() < cutoffday)
-  {
-    var nDate = nlapiSelectValue(invoice, 'invoice-date').split('T');
-    var datesplit = nDate[0].split('-');
-    var Nyear = datesplit[0];
-    var Nday = datesplit[2];
-    var Nmonth = datesplit[1] - 1;
-
-    if (today.getFullYear() > Nyear)
-    {
-      if (today.getMonth() == 0)
-        postingPeriod = getMonthShortName('11') + ' ' + (today.getFullYear() - 1);
-      else
-        postingPeriod = getMonthShortName(today.getMonth() - 1) + ' ' + today.getFullYear();
-    }
-
-    if (Nmonth < today.getMonth() && Nyear == today.getFullYear())
-      postingPeriod = getMonthShortName(today.getMonth() - 1) + ' ' + today.getFullYear();
-  }
-
-  nlapiLogExecution('DEBUG', 'Calculated Posting Period is ', postingPeriod);
-
-  var postingPeriodId = getAccoutingPeriodNetsuiteId('accountingperiod', postingPeriod);
-
-  //nlapiLogExecution('DEBUG', 'Posting Period: ', 'name = ' + postingPeriod + ' Id = ' + postingPeriodId);
-
-  record.setFieldValue('postingperiod', postingPeriodId);
 
   record.setFieldValue('tranid', nlapiSelectValue(invoice, 'invoice-number'));
 
@@ -867,6 +797,12 @@ function CreateVendorBill(invoice)
                 valuetoinsert = nlapiSelectValue(invoice, custfield[0] + '/external-ref-num');
               }
 
+              // 3/24/2015: Added by Doug Quinn to support custom fields that have a blank external-ref-num in Coupa
+              if (custfield[2] == 'Lookup.name')
+              {
+                valuetoinsert = nlapiSelectValue(invoice, custfield[0] + '/name');
+              }
+
             }
           }
 
@@ -895,17 +831,17 @@ function CreateVendorBill(invoice)
 
 
 
-  var shippingamount = parseFloat(nlapiSelectValue(invoice, 'shipping-amount'));
-  var handlingamount = parseFloat(nlapiSelectValue(invoice, 'handling-amount'));
-  var taxamount = parseFloat(nlapiSelectValue(invoice, 'tax-amount'));
-  var miscamount = parseFloat(nlapiSelectValue(invoice, 'misc-amount'));
+  var shippingamount = parseFloatNullNaNSafe(nlapiSelectValue(invoice, 'shipping-amount'));
+  var handlingamount = parseFloatNullNaNSafe(nlapiSelectValue(invoice, 'handling-amount'));
+  var taxamount = parseFloatNullNaNSafe(nlapiSelectValue(invoice, 'tax-amount'));
+  var miscamount = parseFloatNullNaNSafe(nlapiSelectValue(invoice, 'misc-amount'));
 
 
 
 
   var headercharges = false;
   var totalheadercharges;
-  totalheadercharges = parseFloat(shippingamount) + parseFloat(handlingamount) + parseFloat(miscamount);
+  totalheadercharges = parseFloatNullNaNSafe(shippingamount) + parseFloatNullNaNSafe(handlingamount) + parseFloatNullNaNSafe(miscamount);
 
   if (totalheadercharges > 0)
     headercharges = true;
@@ -915,11 +851,11 @@ function CreateVendorBill(invoice)
     if (nlapiGetContext().getSetting('SCRIPT', 'custscript_send_taxcode'))
     {
       if (nlapiGetContext().getSetting('SCRIPT', 'custscript_send_taxcode') == 'F')
-        totalheadercharges = parseFloat(totalheadercharges) + parseFloat(taxamount);
+        totalheadercharges = parseFloatNullNaNSafe(totalheadercharges) + parseFloatNullNaNSafe(taxamount);
 
     }
     else
-      totalheadercharges = parseFloat(totalheadercharges) + parseFloat(taxamount);
+      totalheadercharges = parseFloatNullNaNSafe(totalheadercharges) + parseFloatNullNaNSafe(taxamount);
 
   }
 
@@ -936,12 +872,12 @@ function CreateVendorBill(invoice)
   for (var x = 0; x < invoiceLineNodes.length; x++)
   {
     if (nlapiSelectValue(invoiceLineNodes[x], 'nontaxable') != 'true')
-      taxabletotalamount = parseFloat(taxabletotalamount) + parseFloat(nlapiSelectValue(invoiceLineNodes[x], 'total'));
+      taxabletotalamount = parseFloatNullNaNSafe(taxabletotalamount) + parseFloatNullNaNSafe(nlapiSelectValue(invoiceLineNodes[x], 'total'));
 
-    totalamount = parseFloat(totalamount) + parseFloat(nlapiSelectValue(invoiceLineNodes[x], 'total'));
+    totalamount = parseFloatNullNaNSafe(totalamount) + parseFloatNullNaNSafe(nlapiSelectValue(invoiceLineNodes[x], 'total'));
   }
 
-  var totalheaderamount = parseFloat(totalamount) + parseFloat(totalheadercharges);
+  var totalheaderamount = parseFloatNullNaNSafe(totalamount) + parseFloatNullNaNSafe(totalheadercharges);
   totalheaderamount = totalheaderamount.toFixed(3);
   var totalcalcamount = 0;
 
@@ -963,14 +899,14 @@ function CreateVendorBill(invoice)
     // check for the new tax feature
     if (nlapiGetContext().getSetting('SCRIPT', 'custscript_send_taxcode') == 'F')
     {
-      linetax = parseFloat(nlapiSelectValue(invoiceLineNodes[x], 'tax-amount'));
+      linetax = parseFloatNullNaNSafe(nlapiSelectValue(invoiceLineNodes[x], 'tax-amount'));
 
       if (linetax)
-        totalheaderamount = parseFloat(totalheaderamount) + parseFloat(linetax);
+        totalheaderamount = parseFloatNullNaNSafe(totalheaderamount) + parseFloatNullNaNSafe(linetax);
     }
 
 
-    var invoicelineamount = parseFloat(nlapiSelectValue(invoiceLineNodes[x], 'total'));
+    var invoicelineamount = parseFloatNullNaNSafe(nlapiSelectValue(invoiceLineNodes[x], 'total'));
     var splitaccounting = 'FALSE';
     var actalloc = nlapiSelectNode(invoiceLineNodes[x], 'account-allocations');
     var accountallocations = new Array();
@@ -989,13 +925,13 @@ function CreateVendorBill(invoice)
         // for each split line create a new expense line
         record.selectNewLineItem('expense');
 
-        var lineamount = parseFloat(nlapiSelectValue(accountallocations[i], 'amount'));
+        var lineamount = parseFloatNullNaNSafe(nlapiSelectValue(accountallocations[i], 'amount'));
 
 
-        var linecharge = (parseFloat(lineamount) / parseFloat(taxabletotalamount)) * totalheadercharges;
+        var linecharge = (parseFloatNullNaNSafe(lineamount) / parseFloatNullNaNSafe(taxabletotalamount)) * totalheadercharges;
         var splitlinetax;
 
-        var adjlineamount = parseFloat(lineamount);
+        var adjlineamount = parseFloatNullNaNSafe(lineamount);
 
 
 
@@ -1044,15 +980,15 @@ function CreateVendorBill(invoice)
             else if (nlapiSelectValue(invoiceLineNodes[x], 'tax-amount')) // line level tax and only taxamount no taxcode
             {
 
-              linetax = parseFloat(nlapiSelectValue(invoiceLineNodes[x], 'tax-amount'));
+              linetax = parseFloatNullNaNSafe(nlapiSelectValue(invoiceLineNodes[x], 'tax-amount'));
 
               if (linetax)
               {
 
-                splitlinetax = (parseFloat(lineamount) / parseFloat(invoicelineamount)) * linetax;
-                totalheaderamount = parseFloat(totalheaderamount) + parseFloat(splitlinetax);
-                //adjlineamount = parseFloat(lineamount) + parseFloat(linecharge) + parseFloat(linetax);
-                adjlineamount = parseFloat(lineamount) + parseFloat(splitlinetax);
+                splitlinetax = (parseFloatNullNaNSafe(lineamount) / parseFloatNullNaNSafe(invoicelineamount)) * linetax;
+                totalheaderamount = parseFloatNullNaNSafe(totalheaderamount) + parseFloatNullNaNSafe(splitlinetax);
+                //adjlineamount = parseFloatNullNaNSafe(lineamount) + parseFloatNullNaNSafe(linecharge) + parseFloatNullNaNSafe(linetax);
+                adjlineamount = parseFloatNullNaNSafe(lineamount) + parseFloatNullNaNSafe(splitlinetax);
               }
 
 
@@ -1070,16 +1006,16 @@ function CreateVendorBill(invoice)
           nlapiLogExecution('DEBUG', 'if sendtaxcode set to false', 'lineamount = ' + adjlineamount);
           if (linetax)
           {
-            splitlinetax = (parseFloat(lineamount) / parseFloat(invoicelineamount)) * linetax;
-            adjlineamount = parseFloat(lineamount) + parseFloat(linecharge) + parseFloat(splitlinetax);
+            splitlinetax = (parseFloatNullNaNSafe(lineamount) / parseFloatNullNaNSafe(invoicelineamount)) * linetax;
+            adjlineamount = parseFloatNullNaNSafe(lineamount) + parseFloatNullNaNSafe(linecharge) + parseFloatNullNaNSafe(splitlinetax);
           }
           else
           {
             // customization for nontaxable
             if (nlapiSelectValue(invoiceLineNodes[x], 'nontaxable') == 'true')
-              adjlineamount = parseFloat(lineamount);
+              adjlineamount = parseFloatNullNaNSafe(lineamount);
             else
-              adjlineamount = parseFloat(lineamount) + parseFloat(linecharge);
+              adjlineamount = parseFloatNullNaNSafe(lineamount) + parseFloatNullNaNSafe(linecharge);
           }
 
         }
@@ -1155,7 +1091,7 @@ function CreateVendorBill(invoice)
 
 
 
-        // check for Coupa order line 
+        // check for Coupa order line
         if (nlapiSelectValue(invoiceLineNodes[x], 'order-header-num') && nlapiSelectValue(invoiceLineNodes[x], 'order-line-num'))
         {
           var poheadernum = nlapiSelectValue(invoiceLineNodes[x], 'order-header-num');
@@ -1168,32 +1104,32 @@ function CreateVendorBill(invoice)
         record.setCurrentLineItemValue('expense', 'isbillable', 'T');
 
 
-        /*** old code 
+        /*** old code
 
-				if ((i == 0) && (x == 0)) 
-					{
-						totalcalcamount = parseFloat(adjlineamount);
-					}
-				else 
-					{
-						totalcalcamount = parseFloat(totalcalcamount) + parseFloat(adjlineamount);
-					}
-				*** end of old code ***/
+        if ((i == 0) && (x == 0))
+        {
+        totalcalcamount = parseFloatNullNaNSafe(adjlineamount);
+        }
+        else
+        {
+        totalcalcamount = parseFloatNullNaNSafe(totalcalcamount) + parseFloatNullNaNSafe(adjlineamount);
+        }
+        *** end of old code ***/
 
 
         if ((i == 0) && (x == 0))
         {
           if (nlapiGetContext().getSetting('SCRIPT', 'custscript_send_taxcode') && (nlapiGetContext().getSetting('SCRIPT', 'custscript_send_taxcode') == 'T'))
-            totalcalcamount = parseFloat(adjlineamount) + parseFloat(linecharge);
+            totalcalcamount = parseFloatNullNaNSafe(adjlineamount) + parseFloatNullNaNSafe(linecharge);
           else
-            totalcalcamount = parseFloat(adjlineamount);
+            totalcalcamount = parseFloatNullNaNSafe(adjlineamount);
         }
         else
         {
           if (nlapiGetContext().getSetting('SCRIPT', 'custscript_send_taxcode') && (nlapiGetContext().getSetting('SCRIPT', 'custscript_send_taxcode') == 'T'))
-            totalcalcamount = parseFloat(totalcalcamount) + parseFloat(adjlineamount) + parseFloat(linecharge);
+            totalcalcamount = parseFloatNullNaNSafe(totalcalcamount) + parseFloatNullNaNSafe(adjlineamount) + parseFloatNullNaNSafe(linecharge);
           else
-            totalcalcamount = parseFloat(totalcalcamount) + parseFloat(adjlineamount);
+            totalcalcamount = parseFloatNullNaNSafe(totalcalcamount) + parseFloatNullNaNSafe(adjlineamount);
         }
 
         totalcalcamount = totalcalcamount.toFixed(2);
@@ -1206,18 +1142,18 @@ function CreateVendorBill(invoice)
 
         /*** old code **
 
-				if ((x == invoiceLineNodes.length-1) && (i == accountallocations.length-1))
-    				{
-					var roundingerror = totalheaderamount - totalcalcamount;
-					//nlapiLogExecution('DEBUG', 'Rounding Error Details ', 'RoundingError = ' + roundingerror + 
-					//		' totalheaderamount = ' + totalheaderamount + ' totalcalcamount = ' + totalcalcamount); 
-					if (roundingerror)
-    					{
-						roundingerror = Math.round(parseFloat(roundingerror)*100)/100;
-						adjlineamount = parseFloat(adjlineamount) + roundingerror;
-    					}
-    				}
-				*** old code ******/
+        if ((x == invoiceLineNodes.length-1) && (i == accountallocations.length-1))
+        {
+        var roundingerror = totalheaderamount - totalcalcamount;
+        //nlapiLogExecution('DEBUG', 'Rounding Error Details ', 'RoundingError = ' + roundingerror +
+        //    ' totalheaderamount = ' + totalheaderamount + ' totalcalcamount = ' + totalcalcamount);
+        if (roundingerror)
+        {
+        roundingerror = Math.round(parseFloatNullNaNSafe(roundingerror)*100)/100;
+        adjlineamount = parseFloatNullNaNSafe(adjlineamount) + roundingerror;
+        }
+        }
+        *** old code ******/
 
         var roundingerror = 0;
 
@@ -1229,23 +1165,23 @@ function CreateVendorBill(invoice)
 
           if (roundingerror)
           {
-            roundingerror = Math.round(parseFloat(roundingerror) * 100) / 100;
+            roundingerror = Math.round(parseFloatNullNaNSafe(roundingerror) * 100) / 100;
 
             if (nlapiGetContext().getSetting('SCRIPT', 'custscript_send_taxcode') && (nlapiGetContext().getSetting('SCRIPT', 'custscript_send_taxcode') == 'T'))
             {
               linecharge = linecharge + roundingerror;
             }
             else
-              adjlineamount = parseFloat(adjlineamount) + roundingerror;
+              adjlineamount = parseFloatNullNaNSafe(adjlineamount) + roundingerror;
           }
 
           nlapiLogExecution('DEBUG', 'Rounding Error Details ', 'RoundingError = ' + roundingerror +
             ' totalheaderamount = ' + totalheaderamount + ' totalcalcamount = ' + totalcalcamount + ' Adjusted line amount = ' + adjlineamount);
         }
 
-        nlapiLogExecution('DEBUG', 'before setting amount', 'amount = ' + parseFloat(adjlineamount));
+        nlapiLogExecution('DEBUG', 'before setting amount', 'amount = ' + parseFloatNullNaNSafe(adjlineamount));
 
-        record.setCurrentLineItemValue('expense', 'amount', parseFloat(adjlineamount));
+        record.setCurrentLineItemValue('expense', 'amount', parseFloatNullNaNSafe(adjlineamount));
 
 
 
@@ -1281,6 +1217,12 @@ function CreateVendorBill(invoice)
                     if (custfield[2] == 'Lookup')
                     {
                       valuetoinsert = nlapiSelectValue(invoiceLineNodes[x], custfield[0] + '/external-ref-num');
+                    }
+
+                    // 3/24/2015: Added by Doug Quinn to support custom fields that have a blank external-ref-num in Coupa
+                    if (custfield[2] == 'Lookup.name')
+                    {
+                      valuetoinsert = nlapiSelectValue(invoiceLineNodes[x], custfield[0] + '/name');
                     }
 
                   }
@@ -1333,10 +1275,10 @@ function CreateVendorBill(invoice)
 
       record.selectNewLineItem('expense');
 
-      var lineamount = parseFloat(nlapiSelectValue(invoiceLineNodes[x], 'total'));
-      var linecharge = (parseFloat(lineamount) / parseFloat(taxabletotalamount)) * totalheadercharges;
-      //var adjlineamount = parseFloat(lineamount) + parseFloat(linecharge);
-      var adjlineamount = parseFloat(lineamount);
+      var lineamount = parseFloatNullNaNSafe(nlapiSelectValue(invoiceLineNodes[x], 'total'));
+      var linecharge = (parseFloatNullNaNSafe(lineamount) / parseFloatNullNaNSafe(taxabletotalamount)) * totalheadercharges;
+      //var adjlineamount = parseFloatNullNaNSafe(lineamount) + parseFloatNullNaNSafe(linecharge);
+      var adjlineamount = parseFloatNullNaNSafe(lineamount);
 
 
       if (nlapiGetContext().getSetting('SCRIPT', 'custscript_send_taxcode') == 'T')
@@ -1383,13 +1325,13 @@ function CreateVendorBill(invoice)
           else if (nlapiSelectValue(invoiceLineNodes[x], 'tax-amount')) // line level tax and only taxamount no taxcode
           {
 
-            linetax = parseFloat(nlapiSelectValue(invoiceLineNodes[x], 'tax-amount'));
+            linetax = parseFloatNullNaNSafe(nlapiSelectValue(invoiceLineNodes[x], 'tax-amount'));
 
             if (linetax)
             {
-              totalheaderamount = parseFloat(totalheaderamount) + parseFloat(linetax);
-              //adjlineamount = parseFloat(lineamount) + parseFloat(linecharge) + parseFloat(linetax);
-              adjlineamount = parseFloat(lineamount) + parseFloat(linetax);
+              totalheaderamount = parseFloatNullNaNSafe(totalheaderamount) + parseFloatNullNaNSafe(linetax);
+              //adjlineamount = parseFloatNullNaNSafe(lineamount) + parseFloatNullNaNSafe(linecharge) + parseFloatNullNaNSafe(linetax);
+              adjlineamount = parseFloatNullNaNSafe(lineamount) + parseFloatNullNaNSafe(linetax);
             }
 
 
@@ -1406,14 +1348,14 @@ function CreateVendorBill(invoice)
 
         nlapiLogExecution('DEBUG', 'if sendtaxcode set to false', 'lineamount = ' + adjlineamount);
         if (linetax)
-          adjlineamount = parseFloat(lineamount) + parseFloat(linecharge) + parseFloat(linetax);
+          adjlineamount = parseFloatNullNaNSafe(lineamount) + parseFloatNullNaNSafe(linecharge) + parseFloatNullNaNSafe(linetax);
         else
         {
           // customization for nontaxable
           if (nlapiSelectValue(invoiceLineNodes[x], 'nontaxable') == 'true')
-            adjlineamount = parseFloat(lineamount);
+            adjlineamount = parseFloatNullNaNSafe(lineamount);
           else
-            adjlineamount = parseFloat(lineamount) + parseFloat(linecharge);
+            adjlineamount = parseFloatNullNaNSafe(lineamount) + parseFloatNullNaNSafe(linecharge);
           nlapiLogExecution('DEBUG', 'After adjusting lineamount for linecharges', 'lineamount = ' + adjlineamount + ' linecharge = ' + linecharge);
         }
 
@@ -1505,22 +1447,22 @@ function CreateVendorBill(invoice)
       if (x == 0)
       {
         if (nlapiGetContext().getSetting('SCRIPT', 'custscript_send_taxcode') && (nlapiGetContext().getSetting('SCRIPT', 'custscript_send_taxcode') == 'T'))
-          totalcalcamount = parseFloat(adjlineamount) + parseFloat(linecharge);
+          totalcalcamount = parseFloatNullNaNSafe(adjlineamount) + parseFloatNullNaNSafe(linecharge);
         else
-          totalcalcamount = parseFloat(adjlineamount);
+          totalcalcamount = parseFloatNullNaNSafe(adjlineamount);
       }
       else
       {
         if (nlapiGetContext().getSetting('SCRIPT', 'custscript_send_taxcode') && (nlapiGetContext().getSetting('SCRIPT', 'custscript_send_taxcode') == 'T'))
-          totalcalcamount = parseFloat(totalcalcamount) + parseFloat(adjlineamount) + parseFloat(linecharge);
+          totalcalcamount = parseFloatNullNaNSafe(totalcalcamount) + parseFloatNullNaNSafe(adjlineamount) + parseFloatNullNaNSafe(linecharge);
         else
-          totalcalcamount = parseFloat(totalcalcamount) + parseFloat(adjlineamount);
+          totalcalcamount = parseFloatNullNaNSafe(totalcalcamount) + parseFloatNullNaNSafe(adjlineamount);
       }
 
       totalcalcamount = totalcalcamount.toFixed(2);
 
 
-      //	nlapiLogExecution('DEBUG', 'Invoice Line details ', 'Line ' + x + ' adjlineamount = ' + adjlineamount);
+      //  nlapiLogExecution('DEBUG', 'Invoice Line details ', 'Line ' + x + ' adjlineamount = ' + adjlineamount);
 
       var roundingerror = 0;
 
@@ -1529,26 +1471,26 @@ function CreateVendorBill(invoice)
 
         nlapiLogExecution('DEBUG', 'Total Header Amount = ' + totalheaderamount + ' Calculated Amount = ' + totalcalcamount);
         roundingerror = totalheaderamount - totalcalcamount;
-        /*nlapiLogExecution('DEBUG', 'Rounding Error Details ', 'RoundingError = ' + roundingerror + 
-						' totalheaderamount = ' + totalheaderamount + ' totalcalcamount = ' + totalcalcamount); */
+        /*nlapiLogExecution('DEBUG', 'Rounding Error Details ', 'RoundingError = ' + roundingerror +
+        ' totalheaderamount = ' + totalheaderamount + ' totalcalcamount = ' + totalcalcamount); */
         if (roundingerror)
         {
-          roundingerror = Math.round(parseFloat(roundingerror) * 100) / 100;
+          roundingerror = Math.round(parseFloatNullNaNSafe(roundingerror) * 100) / 100;
 
           if (nlapiGetContext().getSetting('SCRIPT', 'custscript_send_taxcode') && (nlapiGetContext().getSetting('SCRIPT', 'custscript_send_taxcode') == 'T'))
           {
             linecharge = linecharge + roundingerror;
           }
           else
-            adjlineamount = parseFloat(adjlineamount) + roundingerror;
+            adjlineamount = parseFloatNullNaNSafe(adjlineamount) + roundingerror;
         }
 
         nlapiLogExecution('DEBUG', 'Rounding Error Details ', 'RoundingError = ' + roundingerror +
           ' totalheaderamount = ' + totalheaderamount + ' totalcalcamount = ' + totalcalcamount + ' Adjusted line amount = ' + adjlineamount);
       }
 
-      nlapiLogExecution('DEBUG', 'before setting amount', 'amount = ' + parseFloat(adjlineamount));
-      record.setCurrentLineItemValue('expense', 'amount', parseFloat(adjlineamount));
+      nlapiLogExecution('DEBUG', 'before setting amount', 'amount = ' + parseFloatNullNaNSafe(adjlineamount));
+      record.setCurrentLineItemValue('expense', 'amount', parseFloatNullNaNSafe(adjlineamount));
 
       // check for custom fields on line level
       if (nlapiGetContext().getSetting('SCRIPT', 'custscript_customfield_line_count'))
@@ -1589,9 +1531,15 @@ function CreateVendorBill(invoice)
 
                   if (custfield[2] == 'Lookup')
                   {
-
                     valuetoinsert = nlapiSelectValue(invoiceLineNodes[x], custfield[0] + '/external-ref-num');
-                    nlapiLogExecution('DEBUG', 'Line Custom Inside coupatype = lookup' + y, 'Coupa field = ' + nlapiSelectValue(invoiceLineNodes[x], custfield[0]) + ' ValuetoInsert = ' + valuetoinsert);
+                    nlapiLogExecution('DEBUG', 'Line Custom Inside coupatype = lookup.external-ref-num' + y, 'Coupa field = ' + nlapiSelectValue(invoiceLineNodes[x], custfield[0]) + ' ValuetoInsert = ' + valuetoinsert);
+                  }
+
+                  // 3/24/2015: Added by Doug Quinn to support custom fields that have a blank external-ref-num in Coupa
+                  if (custfield[2] == 'Lookup.name')
+                  {
+                    valuetoinsert = nlapiSelectValue(invoiceLineNodes[x], custfield[0] + '/name');
+                    nlapiLogExecution('DEBUG', 'Line Custom Inside coupatype = lookup.name' + y, 'Coupa field = ' + nlapiSelectValue(invoiceLineNodes[x], custfield[0]) + ' ValuetoInsert = ' + valuetoinsert);
                   }
 
                 }
@@ -1627,13 +1575,13 @@ function CreateVendorBill(invoice)
 
       /**
 
-      if (headercharges && 
-      	nlapiGetContext().getSetting('SCRIPT', 'custscript_send_taxcode') && 
-      	(nlapiGetContext().getSetting('SCRIPT', 'custscript_send_taxcode') == 'T') &&
-      	taxcodeexists)
-      	{
-           SetHeaderChargesasExpenseLine(record, invoice, invoiceLineNodes[x], linecharge.toFixed(2));
-      	}
+      if (headercharges &&
+      nlapiGetContext().getSetting('SCRIPT', 'custscript_send_taxcode') &&
+      (nlapiGetContext().getSetting('SCRIPT', 'custscript_send_taxcode') == 'T') &&
+      taxcodeexists)
+      {
+      SetHeaderChargesasExpenseLine(record, invoice, invoiceLineNodes[x], linecharge.toFixed(2));
+      }
 
       **/
 
@@ -1764,7 +1712,7 @@ function SetHeaderChargesasExpenseLine(record, invoice, invoiceline, linecharge,
     record.setCurrentLineItemValue('expense', 'custcol_coupaponum', poheadernum + '-' + polinenum);
   }
 
-  record.setCurrentLineItemValue('expense', 'amount', parseFloat(linecharge));
+  record.setCurrentLineItemValue('expense', 'amount', parseFloatNullNaNSafe(linecharge));
 
 
   if (isSplit)
@@ -1814,9 +1762,15 @@ function SetHeaderChargesasExpenseLine(record, invoice, invoiceline, linecharge,
 
               if (custfield[2] == 'Lookup')
               {
-
                 valuetoinsert = nlapiSelectValue(invoiceline, custfield[0] + '/external-ref-num');
-                nlapiLogExecution('DEBUG', 'Line Custom Inside coupatype = lookup' + y, 'Coupa field = ' + nlapiSelectValue(invoiceline, custfield[0]) + ' ValuetoInsert = ' + valuetoinsert);
+                nlapiLogExecution('DEBUG', 'Line Custom Inside coupatype = lookup.external-ref-num' + y, 'Coupa field = ' + nlapiSelectValue(invoiceline, custfield[0]) + ' ValuetoInsert = ' + valuetoinsert);
+              }
+
+              // 3/24/2015: Added by Doug Quinn to support custom fields that have a blank external-ref-num in Coupa
+              if (custfield[2] == 'Lookup.name')
+              {
+                valuetoinsert = nlapiSelectValue(invoiceline, custfield[0] + '/name');
+                nlapiLogExecution('DEBUG', 'Line Custom Inside coupatype = lookup.name' + y, 'Coupa field = ' + nlapiSelectValue(invoiceline, custfield[0]) + ' ValuetoInsert = ' + valuetoinsert);
               }
 
             }
@@ -1851,7 +1805,7 @@ function SetHeaderChargesasExpenseLine(record, invoice, invoiceline, linecharge,
   record.commitLineItem('expense');
 }
 
-
+//Not Currently used by this script
 function UpdateVendorBill(invoice, id)
 {
   //nlapiLogExecution('DEBUG', 'Update Vendor Bill ', 'Netsuite Id = ' + id + ' Invoice Number = ' + nlapiSelectValue(invoice, 'invoice-number'));
@@ -1900,10 +1854,10 @@ function UpdateVendorBill(invoice, id)
     var Nday = datesplit[2];
     var Nmonth = datesplit[1] - 1;
     /*
-		nlapiLogExecution('DEBUG', 'Posting period details', 'invoicemonth = ' + Nmonth 
-															+ ' today month = ' + today.getMonth()
-															+ ' invoice year = ' + Nyear
-															+ ' today year = ' + today.getFullYear()); */
+    nlapiLogExecution('DEBUG', 'Posting period details', 'invoicemonth = ' + Nmonth
+    + ' today month = ' + today.getMonth()
+    + ' invoice year = ' + Nyear
+    + ' today year = ' + today.getFullYear()); */
     if (today.getFullYear() > Nyear)
     {
       if (today.getMonth() == 0)
@@ -1940,20 +1894,20 @@ function UpdateVendorBill(invoice, id)
   }
 
 
-  var shippingamount = parseFloat(nlapiSelectValue(invoice, 'shipping-amount'));
-  var handlingamount = parseFloat(nlapiSelectValue(invoice, 'handling-amount'));
-  var taxamount = parseFloat(nlapiSelectValue(invoice, 'tax-amount'));
-  var miscamount = parseFloat(nlapiSelectValue(invoice, 'misc-amount'));
+  var shippingamount = parseFloatNullNaNSafe(nlapiSelectValue(invoice, 'shipping-amount'));
+  var handlingamount = parseFloatNullNaNSafe(nlapiSelectValue(invoice, 'handling-amount'));
+  var taxamount = parseFloatNullNaNSafe(nlapiSelectValue(invoice, 'tax-amount'));
+  var miscamount = parseFloatNullNaNSafe(nlapiSelectValue(invoice, 'misc-amount'));
 
-  /* nlapiLogExecution('DEBUG', 'Other Charges', 'Shipping = ' + shippingamount + ' Handling = ' + handlingamount 
-												+ ' Taxamount = ' + taxamount + ' miscamount = ' + miscamount); */
+  /* nlapiLogExecution('DEBUG', 'Other Charges', 'Shipping = ' + shippingamount + ' Handling = ' + handlingamount
+  + ' Taxamount = ' + taxamount + ' miscamount = ' + miscamount); */
 
 
   var totalheadercharges;
   if (lineleveltaxation == 'false')
-    totalheadercharges = parseFloat(shippingamount) + parseFloat(handlingamount) + parseFloat(taxamount) + parseFloat(miscamount);
+    totalheadercharges = parseFloatNullNaNSafe(shippingamount) + parseFloatNullNaNSafe(handlingamount) + parseFloatNullNaNSafe(taxamount) + parseFloatNullNaNSafe(miscamount);
   else
-    totalheadercharges = parseFloat(shippingamount) + parseFloat(handlingamount) + parseFloat(miscamount);
+    totalheadercharges = parseFloatNullNaNSafe(shippingamount) + parseFloatNullNaNSafe(handlingamount) + parseFloatNullNaNSafe(miscamount);
 
   var invoiceLine = nlapiSelectNode(invoice, 'invoice-lines');
   var invoiceLineNodes = new Array();
@@ -1965,17 +1919,17 @@ function UpdateVendorBill(invoice, id)
 
   for (var x = 0; x < invoiceLineNodes.length; x++)
   {
-    totalamount = parseFloat(totalamount) + parseFloat(nlapiSelectValue(invoiceLineNodes[x], 'total'));
+    totalamount = parseFloatNullNaNSafe(totalamount) + parseFloatNullNaNSafe(nlapiSelectValue(invoiceLineNodes[x], 'total'));
   }
 
-  var totalheaderamount = parseFloat(totalamount) + parseFloat(totalheadercharges);
+  var totalheaderamount = parseFloatNullNaNSafe(totalamount) + parseFloatNullNaNSafe(totalheadercharges);
   totalheaderamount = totalheaderamount.toFixed(3);
   var totalcalcamount = 0;
 
   var expenselinetotal = record.getLineItemCount('expense');
 
   /* void the existing expense lines
-   * 
+   *
    */
   if (expenselinetotal >= 1)
   {
@@ -1994,12 +1948,12 @@ function UpdateVendorBill(invoice, id)
   for (var x = 0; x < invoiceLineNodes.length; x++)
   {
 
-    var linetax = parseFloat(nlapiSelectValue(invoiceLineNodes[x], 'tax-amount'));
+    var linetax = parseFloatNullNaNSafe(nlapiSelectValue(invoiceLineNodes[x], 'tax-amount'));
 
     if (linetax)
-      totalheaderamount = parseFloat(totalheaderamount) + parseFloat(linetax);
+      totalheaderamount = parseFloatNullNaNSafe(totalheaderamount) + parseFloatNullNaNSafe(linetax);
 
-    var invoicelineamount = parseFloat(nlapiSelectValue(invoiceLineNodes[x], 'total'));
+    var invoicelineamount = parseFloatNullNaNSafe(nlapiSelectValue(invoiceLineNodes[x], 'total'));
     var splitaccounting = 'FALSE';
     var actalloc = nlapiSelectNode(invoiceLineNodes[x], 'account-allocations');
     var accountallocations = new Array();
@@ -2014,20 +1968,20 @@ function UpdateVendorBill(invoice, id)
     {
       for (var i = 0; i < accountallocations.length; i++)
       {
-        var lineamount = parseFloat(nlapiSelectValue(accountallocations[i], 'amount'));
-        var linecharge = (parseFloat(lineamount) / parseFloat(totalamount)) * totalheadercharges;
+        var lineamount = parseFloatNullNaNSafe(nlapiSelectValue(accountallocations[i], 'amount'));
+        var linecharge = (parseFloatNullNaNSafe(lineamount) / parseFloatNullNaNSafe(totalamount)) * totalheadercharges;
         var splitlinetax;
         if (linetax)
         {
-          splitlinetax = (parseFloat(lineamount) / parseFloat(invoicelineamount)) * linetax;
+          splitlinetax = (parseFloatNullNaNSafe(lineamount) / parseFloatNullNaNSafe(invoicelineamount)) * linetax;
           //nlapiLogExecution('DEBUG', 'split line tax details ', 'splitline amount = ' + lineamount + ' splitlinetax = ' + splitlinetax);
         }
         var adjlineamount;
 
         if (linetax)
-          adjlineamount = parseFloat(lineamount) + parseFloat(linecharge) + parseFloat(splitlinetax);
+          adjlineamount = parseFloatNullNaNSafe(lineamount) + parseFloatNullNaNSafe(linecharge) + parseFloatNullNaNSafe(splitlinetax);
         else
-          adjlineamount = parseFloat(lineamount) + parseFloat(linecharge);
+          adjlineamount = parseFloatNullNaNSafe(lineamount) + parseFloatNullNaNSafe(linecharge);
 
         adjlineamount = adjlineamount.toFixed(2);
         var accountNode = nlapiSelectNode(accountallocations[i], 'account');
@@ -2082,7 +2036,7 @@ function UpdateVendorBill(invoice, id)
             record.setCurrentLineItemValue('expense', 'class', classId);
         }
 
-        // check for Coupa order line 
+        // check for Coupa order line
         if (nlapiSelectValue(invoiceLineNodes[x], 'order-header-num') && nlapiSelectValue(invoiceLineNodes[x], 'order-line-num'))
         {
           var poheadernum = nlapiSelectValue(invoiceLineNodes[x], 'order-header-num');
@@ -2094,24 +2048,24 @@ function UpdateVendorBill(invoice, id)
         record.setCurrentLineItemValue('expense', 'memo', nlapiSelectValue(invoiceLineNodes[x], 'description'));
         record.setCurrentLineItemValue('expense', 'isbillable', 'T');
 
-        if ((i == 0) && (x == 0)) totalcalcamount = parseFloat(adjlineamount);
-        else totalcalcamount = parseFloat(totalcalcamount) + parseFloat(adjlineamount);
+        if ((i == 0) && (x == 0)) totalcalcamount = parseFloatNullNaNSafe(adjlineamount);
+        else totalcalcamount = parseFloatNullNaNSafe(totalcalcamount) + parseFloatNullNaNSafe(adjlineamount);
 
-        //	nlapiLogExecution('DEBUG', 'Invoice Line details ', 'Invoice Line ' + x + ' SplitLine = ' + i + ' adjlineamount = ' + adjlineamount);
+        //  nlapiLogExecution('DEBUG', 'Invoice Line details ', 'Invoice Line ' + x + ' SplitLine = ' + i + ' adjlineamount = ' + adjlineamount);
 
         if ((x == invoiceLineNodes.length - 1) && (i == accountallocations.length - 1))
         {
           var roundingerror = totalheaderamount - totalcalcamount;
 
-          /*nlapiLogExecution('DEBUG', 'Rounding Error Details ', 'RoundingError = ' + roundingerror + 
-							' totalheaderamount = ' + totalheaderamount + ' totalcalcamount = ' + totalcalcamount); */
+          /*nlapiLogExecution('DEBUG', 'Rounding Error Details ', 'RoundingError = ' + roundingerror +
+          ' totalheaderamount = ' + totalheaderamount + ' totalcalcamount = ' + totalcalcamount); */
           if (roundingerror)
           {
-            roundingerror = Math.round(parseFloat(roundingerror) * 100) / 100;
-            adjlineamount = parseFloat(adjlineamount) + roundingerror;
+            roundingerror = Math.round(parseFloatNullNaNSafe(roundingerror) * 100) / 100;
+            adjlineamount = parseFloatNullNaNSafe(adjlineamount) + roundingerror;
           }
         }
-        record.setCurrentLineItemValue('expense', 'amount', parseFloat(adjlineamount));
+        record.setCurrentLineItemValue('expense', 'amount', parseFloatNullNaNSafe(adjlineamount));
         record.commitLineItem('expense');
 
       } // end of the for loop for split lines
@@ -2120,14 +2074,14 @@ function UpdateVendorBill(invoice, id)
     else
     {
 
-      var lineamount = parseFloat(nlapiSelectValue(invoiceLineNodes[x], 'total'));
-      var linecharge = (parseFloat(lineamount) / parseFloat(totalamount)) * totalheadercharges;
+      var lineamount = parseFloatNullNaNSafe(nlapiSelectValue(invoiceLineNodes[x], 'total'));
+      var linecharge = (parseFloatNullNaNSafe(lineamount) / parseFloatNullNaNSafe(totalamount)) * totalheadercharges;
       var adjlineamount;
 
       if (linetax)
-        adjlineamount = parseFloat(lineamount) + parseFloat(linecharge) + parseFloat(linetax);
+        adjlineamount = parseFloatNullNaNSafe(lineamount) + parseFloatNullNaNSafe(linecharge) + parseFloatNullNaNSafe(linetax);
       else
-        adjlineamount = parseFloat(lineamount) + parseFloat(linecharge);
+        adjlineamount = parseFloatNullNaNSafe(lineamount) + parseFloatNullNaNSafe(linecharge);
       adjlineamount = adjlineamount.toFixed(2);
       var accountNode = nlapiSelectNode(invoiceLineNodes[x], 'account');
 
@@ -2169,7 +2123,7 @@ function UpdateVendorBill(invoice, id)
       }
 
 
-      // check for Coupa order line 
+      // check for Coupa order line
       if (nlapiSelectValue(invoiceLineNodes[x], 'order-header-num') && nlapiSelectValue(invoiceLineNodes[x], 'order-line-num'))
       {
         var poheadernum = nlapiSelectValue(invoiceLineNodes[x], 'order-header-num');
@@ -2180,8 +2134,8 @@ function UpdateVendorBill(invoice, id)
       record.setCurrentLineItemValue('expense', 'memo', nlapiSelectValue(invoiceLineNodes[x], 'description'));
       record.setCurrentLineItemValue('expense', 'isbillable', 'T');
 
-      if (x == 0) totalcalcamount = parseFloat(adjlineamount);
-      else totalcalcamount = parseFloat(totalcalcamount) + parseFloat(adjlineamount);
+      if (x == 0) totalcalcamount = parseFloatNullNaNSafe(adjlineamount);
+      else totalcalcamount = parseFloatNullNaNSafe(totalcalcamount) + parseFloatNullNaNSafe(adjlineamount);
 
 
       //nlapiLogExecution('DEBUG', 'Invoice Line details ', 'Line ' + x + ' adjlineamount = ' + adjlineamount);
@@ -2190,31 +2144,31 @@ function UpdateVendorBill(invoice, id)
       {
         var roundingerror = totalheaderamount - totalcalcamount;
 
-        /*nlapiLogExecution('DEBUG', 'Rounding Error Details ', 'RoundingError = ' + roundingerror + 
-						' totalheaderamount = ' + totalheaderamount + ' totalcalcamount = ' + totalcalcamount); */
+        /*nlapiLogExecution('DEBUG', 'Rounding Error Details ', 'RoundingError = ' + roundingerror +
+        ' totalheaderamount = ' + totalheaderamount + ' totalcalcamount = ' + totalcalcamount); */
         if (roundingerror)
         {
-          roundingerror = Math.round(parseFloat(roundingerror) * 100) / 100;
-          adjlineamount = parseFloat(adjlineamount) + roundingerror;
+          roundingerror = Math.round(parseFloatNullNaNSafe(roundingerror) * 100) / 100;
+          adjlineamount = parseFloatNullNaNSafe(adjlineamount) + roundingerror;
         }
       }
-      record.setCurrentLineItemValue('expense', 'amount', parseFloat(adjlineamount));
+      record.setCurrentLineItemValue('expense', 'amount', parseFloatNullNaNSafe(adjlineamount));
       record.commitLineItem('expense');
     } // end of else --- i.e if not split accounting
 
   } // end of main for loop that goes through each invoice line
 
   /* delete the remaining expense lines
-	if (expenselinetotal > invoiceLineNodes.length)
-		{
-		for (var a = invoiceLineNodes.length+1; a <= expenselinetotal; a++ )
-			{
-			nlapiLogExecution('DEBUG', 'before deleting expense line '+ a, 'Expenselinetotoal = ' + expenselinetotal);
-			record.removeLineItem('expense', a);
-			nlapiLogExecution('DEBUG', 'after deleting expense line '+ a, 'Expenselinetotoal = ' + expenselinetotal);
-			}
-		}
-	 delete the remaining expense lines */
+  if (expenselinetotal > invoiceLineNodes.length)
+  {
+  for (var a = invoiceLineNodes.length+1; a <= expenselinetotal; a++ )
+  {
+  nlapiLogExecution('DEBUG', 'before deleting expense line '+ a, 'Expenselinetotoal = ' + expenselinetotal);
+  record.removeLineItem('expense', a);
+  nlapiLogExecution('DEBUG', 'after deleting expense line '+ a, 'Expenselinetotoal = ' + expenselinetotal);
+  }
+  }
+  delete the remaining expense lines */
 
   try
   {
@@ -2311,7 +2265,7 @@ function getNetsuiteId(objectinternalid, objectname)
 
   //nlapiLogExecution('DEBUG', 'in getNetsuitetermid after calling Search record', coupaTerm);
 
-  //	if (searchresults.length !=1)
+  //  if (searchresults.length !=1)
   if (!searchresults)
   {
     nlapiLogExecution('Error', 'Error getting ID for', 'internalobjectid = ' + objectinternalid + ' objectname =  ' + objectname);
@@ -2456,7 +2410,7 @@ function getNetsuiteCurrency(objectinternalid, objectname)
 
   //nlapiLogExecution('DEBUG', 'in getNetsuitetermid after calling Search record', coupaTerm);
 
-  //	if (searchresults.length !=1)
+  //  if (searchresults.length !=1)
   if (!searchresults)
   {
     nlapiLogExecution('Error', 'Error getting ID for', 'internalobjectid = ' + objectinternalid + ' objectname =  ' + objectname);
@@ -2512,4 +2466,140 @@ function readFormConfig()
   }
 
 
+}
+
+function executeCoupaQuery(sAPIURL, sAPIKey, sQueryContext)
+{
+  var sHeaders = new Array();
+  sHeaders['Accept'] = 'text/xml';
+  sHeaders['X-COUPA-API-KEY'] = sAPIKey;
+  var oAPIResponse;
+
+  nlapiLogExecution('DEBUG', 'Executing Coupa Query', 'Context: ' + sQueryContext + ' URL: ' + sAPIURL);
+
+  //try start
+  try
+  {
+    oAPIResponse = nlapiRequestURL(sAPIURL, null, sHeaders);
+  }
+  catch (error)
+  {
+    if (error instanceof nlobjError)
+    {
+      var errordetails;
+      errorcode = error.getCode();
+      switch (errorcode)
+      {
+        case "SSS_REQUEST_TIME_EXCEEDED":
+          errordetails = "Connection closed because it has exceed the time out period (NetSuite has not received a response after 5 seconds on initial connection or after 45 seconds on the request).";
+          exit = true;
+          break;
+        default:
+          errordetails = error.getDetails() + ".";
+          exit = true;
+          break;
+      }
+      nlapiLogExecution('ERROR', 'Processing Error - Unable to do Coupa request api call to: ' + sQueryContext, 'Error Code = ' + errorcode + ' Error Description = ' + errordetails);
+      nlapiSendEmail(-5, nlapiGetContext().getSetting('SCRIPT', 'custscript_emailaddr_notifications'), nlapiGetContext().getSetting('SCRIPT', 'custscript_acccountname') + 'Processing Error - Unable to do Coupa request api call to: ' + sQueryContext,
+        'Error Code = ' + errorcode + ' Error Description = ' + errordetails);
+
+      return oAPIResponse;
+    }
+  } //catch end
+
+  return oAPIResponse;
+}
+
+function isOpenCoupaPostingPeriod(sValueToCheck, lookupValueOpenPostingPeriodNames)
+{
+  return lookupValueOpenPostingPeriodNames.indexOf(sValueToCheck) >= 0;
+}
+
+function parseFloatNullNaNSafe(sValueToParse)
+{
+  var parsedValue = parseFloat(sValueToParse);
+  if (!sValueToParse || isNaN(parsedValue))
+    return parseFloat('0.00');
+
+  return parsedValue;
+}
+
+function parseIntNullNaNSafe(sValueToParse)
+{
+  var parsedValue = parseInt(sValueToParse);
+  if (!sValueToParse || isNaN(parsedValue))
+    return parseInt('0');
+
+  return parsedValue;
+}
+
+function setNetSuitePostingPeriod(invoice, record, lookupValueOpenPostingPeriodNames)
+{
+
+  var paymentPeriodOverrideFieldName = nlapiGetContext().getSetting('SCRIPT', 'custscript_customfield_paymentperiodover');
+  var potentialPostingPeriod = '';
+  //Posting Period Override as parameter to the script
+  if (paymentPeriodOverrideFieldName)
+  {
+    paymentPeriodOverrideFieldName = paymentPeriodOverrideFieldName + '/name';
+
+    //Get the posting period override value out of Coupa
+    potentialPostingPeriod = nlapiSelectValue(invoice, paymentPeriodOverrideFieldName);
+  }
+  else
+    nlapiLogExecution('DEBUG', 'Get Posting Period', 'paymentPeriodOverrideFieldName script parameter is blank');
+
+
+  //Use default posting period logic if an override was not found
+  //Customer default posting period logic is:
+  //  Use the invoice date, not the transaction time to get the potential posting period
+  //  If the Day of the month of invoice date is <= cutoff days, then set potential posting period go one posting period previous
+  //  If this potential posting period matches an Open (active) Coupa Posting Period in the Posting Periods lookup, then set, otherwise block and error.
+  if (!potentialPostingPeriod)
+  {
+
+
+    var cutoffday = parseIntNullNaNSafe(nlapiGetContext().getSetting('SCRIPT', 'custscript_cutoffdate'));
+    if (cutoffday == 0)
+      cutoffday = 5; //default cutoff day if not set as a script deployment param
+
+    var invoiceDateCoupaFormat = nlapiSelectValue(invoice, 'invoice-date').split('T');
+    var invoiceDateCoupaFormatSplit = invoiceDateCoupaFormat[0].split('-');
+    var invoiceDateYear = parseIntNullNaNSafe(invoiceDateCoupaFormatSplit[0]);
+    var invoiceDateMonth = parseIntNullNaNSafe(invoiceDateCoupaFormatSplit[1]) - 1; // - 1 is so that function: getMonthShortName properly matches array notation
+    var invoiceDateDay = parseIntNullNaNSafe(invoiceDateCoupaFormatSplit[2]);
+
+    if (invoiceDateDay <= cutoffday) // roll back a potential posting period
+    {
+      if (--invoiceDateMonth < 0) // go back one month
+      {
+        invoiceDateMonth = 11; // set to December and go back a year if we were at January
+        --invoiceDateYear;
+      }
+      nlapiLogExecution('DEBUG', 'Get Posting Period', 'Rolling back a month because (invoiceDateDay <= cutoffday) --- invoiceDateDay: ' + invoiceDateDay + ' cutoffday: ' + cutoffday);
+
+    }
+    //Construct posting period name as they are in NetSuite and Coupa: ex. 'Mar 2015'
+    potentialPostingPeriod = getMonthShortName(invoiceDateMonth) + ' ' + invoiceDateYear;
+    nlapiLogExecution('DEBUG', 'Get Posting Period', 'Potential Posting Period Default is: ' + potentialPostingPeriod);
+  }
+  else
+  {
+    nlapiLogExecution('DEBUG', 'Get Posting Period', 'Potential Posting Period Override is: ' + potentialPostingPeriod);
+  }
+
+  var postingPeriodId = getAccoutingPeriodNetsuiteId('accountingperiod', potentialPostingPeriod);
+
+  if ((postingPeriodId == 'INVALID_PERIOD_NAME') || (!isOpenCoupaPostingPeriod(potentialPostingPeriod, lookupValueOpenPostingPeriodNames)))
+  {
+    nlapiLogExecution('ERROR', 'Processing Error - Invalid Posting Period', 'Invoice Number: ' + nlapiSelectValue(invoice, 'invoice-number') + ' Period: ' + potentialPostingPeriod + ' is not active in the Coupa Posting Periods Lookup');
+    nlapiSendEmail(-5,
+      nlapiGetContext().getSetting('SCRIPT', 'custscript_emailaddr_notifications'),
+      nlapiGetContext().getSetting('SCRIPT', 'custscript_acccountname') + ' Invoice Integration:Processing Error - Invalid Posting Period',
+      'Invoice Number: ' + nlapiSelectValue(invoice, 'invoice-number') + ' Period: ' + potentialPostingPeriod + ' is not active in the Coupa Posting Periods Lookup');
+    return false;
+  }
+
+  record.setFieldValue('postingperiod', postingPeriodId);
+  return true;
 }
